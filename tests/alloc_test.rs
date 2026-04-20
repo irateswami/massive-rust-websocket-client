@@ -8,15 +8,14 @@
 
 use std::alloc::System;
 
-use stats_alloc::{Region, StatsAlloc, INSTRUMENTED_SYSTEM};
+use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
 use massive_rust_client::websocket::{models::EquityTrade, peek_event_type};
 
-const TRADE_JSON: &str =
-    r#"{"ev":"T","sym":"SPY","x":1,"i":"tr1","z":3,"p":450.25,"s":100,"c":[14,41],"t":1700000000000,"q":42}"#;
+const TRADE_JSON: &str = r#"{"ev":"T","sym":"SPY","x":1,"i":"tr1","z":3,"p":450.25,"s":100,"c":[14,41],"t":1700000000000,"q":42}"#;
 
 /// peek_event_type should be near-zero-alloc.
 /// memchr::memmem::find builds a small internal Finder per call (~23 bytes in debug).
@@ -54,8 +53,8 @@ fn peek_event_type_near_zero_alloc() {
 }
 
 /// Model deserialization: assert a bounded number of allocations.
-/// serde_json + CompactString will allocate for the Vec<i32> conditions field
-/// and potentially for strings exceeding inline capacity. We assert an upper bound.
+/// serde_json + CompactString + SmallVec should be near-zero alloc for typical payloads.
+/// SmallVec<[i32; 4]> inlines conditions, CompactString inlines short symbols.
 #[test]
 fn trade_deser_bounded_allocs() {
     // Warm up.
@@ -71,9 +70,9 @@ fn trade_deser_bounded_allocs() {
     let stats = reg.change();
 
     // Each trade deser should allocate at most:
-    //  - 1 Vec<i32> for conditions (typically 1 alloc for the backing buffer)
+    //  - SmallVec<[i32; 4]> for conditions → 0 allocs for ≤4 conditions (inline)
     //  - Strings within CompactString inline capacity (24 bytes) → 0 allocs
-    // So we expect ~1 alloc per iteration. Allow headroom of 3x for platform variance.
+    // With SmallVec, typical trades should be zero-alloc. Allow headroom for platform variance.
     let allocs_per_iter = stats.allocations as f64 / iterations as f64;
     assert!(
         allocs_per_iter <= 3.0,
@@ -103,8 +102,7 @@ fn full_pipeline_bounded_allocs() {
     };
 
     // Warm up.
-    let msgs: Vec<Box<serde_json::value::RawValue>> =
-        serde_json::from_str(&batch_10).unwrap();
+    let msgs: Vec<&serde_json::value::RawValue> = serde_json::from_str(&batch_10).unwrap();
     for raw in &msgs {
         let _ = peek_event_type(raw.get().as_bytes());
         let _: EquityTrade = serde_json::from_str(raw.get()).unwrap();
@@ -113,8 +111,7 @@ fn full_pipeline_bounded_allocs() {
     let reg = Region::new(GLOBAL);
     let iterations = 100;
     for _ in 0..iterations {
-        let msgs: Vec<Box<serde_json::value::RawValue>> =
-            serde_json::from_str(&batch_10).unwrap();
+        let msgs: Vec<&serde_json::value::RawValue> = serde_json::from_str(&batch_10).unwrap();
         for raw in &msgs {
             let _ = peek_event_type(raw.get().as_bytes());
             let trade: EquityTrade = serde_json::from_str(raw.get()).unwrap();
@@ -123,13 +120,13 @@ fn full_pipeline_bounded_allocs() {
     }
     let stats = reg.change();
 
-    // 10 messages per iteration, each with ~2-3 allocs (RawValue box + Vec conditions).
-    // Plus 1 alloc for the outer Vec<Box<RawValue>>.
-    // Budget: 50 allocs per iteration of 10 messages (generous headroom).
+    // 10 messages per iteration using &RawValue (borrows from source, no per-element Box).
+    // Allocations: 1 Vec pointer array + SmallVec inlines conditions → near-zero per-element.
+    // Budget: 20 allocs per iteration of 10 messages.
     let allocs_per_iter = stats.allocations as f64 / iterations as f64;
     assert!(
-        allocs_per_iter <= 50.0,
-        "full pipeline averages {:.1} allocs/iter for 10-msg batch (max: 50). \
+        allocs_per_iter <= 20.0,
+        "full pipeline averages {:.1} allocs/iter for 10-msg batch (max: 20). \
          Total: {} allocs over {} iterations",
         allocs_per_iter,
         stats.allocations,

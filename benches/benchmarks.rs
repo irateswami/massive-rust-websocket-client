@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use massive_rust_client::websocket::models::*;
+use massive_rust_client::websocket::{models::*, peek_event_type};
 
 // ---------------------------------------------------------------------------
 // Fixtures: realistic JSON payloads matching the wire format
@@ -103,8 +103,7 @@ fn bench_array_parse(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(data.len() as u64));
         group.bench_with_input(BenchmarkId::from_parameter(name), &data, |b, data| {
             b.iter(|| {
-                let _msgs: Vec<Box<serde_json::value::RawValue>> =
-                    serde_json::from_str(data).unwrap();
+                let _msgs: Vec<&serde_json::value::RawValue> = serde_json::from_str(data).unwrap();
             });
         });
     }
@@ -127,23 +126,14 @@ fn bench_event_type_peek(c: &mut Criterion) {
         });
     });
 
-    // Alternative: byte-level scan for "ev" field.
+    // Current approach: byte-level scan using memchr.
     group.bench_function("byte_scan", |b| {
         b.iter(|| {
-            let _ = peek_ev_byte_scan(EQUITY_TRADE_JSON.as_bytes());
+            let _ = peek_event_type(EQUITY_TRADE_JSON.as_bytes());
         });
     });
 
     group.finish();
-}
-
-/// Byte-scan approach to extract the "ev" field value.
-fn peek_ev_byte_scan(raw: &[u8]) -> Option<&str> {
-    let needle = b"\"ev\":\"";
-    let pos = raw.windows(needle.len()).position(|w| w == needle)?;
-    let start = pos + needle.len();
-    let end = raw[start..].iter().position(|&b| b == b'"')? + start;
-    std::str::from_utf8(&raw[start..end]).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -155,12 +145,12 @@ fn bench_full_pipeline(c: &mut Criterion) {
 
     // Single trade through the full pipeline.
     group.bench_function("single_trade", |b| {
-        let data = SERVER_ARRAY_1.as_bytes();
+        let data = SERVER_ARRAY_1;
         b.iter(|| {
-            let msgs: Vec<Box<serde_json::value::RawValue>> = serde_json::from_slice(data).unwrap();
+            let msgs: Vec<&serde_json::value::RawValue> = serde_json::from_str(data).unwrap();
             for raw_msg in &msgs {
                 let raw = raw_msg.get();
-                let _ = peek_ev_byte_scan(raw.as_bytes());
+                let _ = peek_event_type(raw.as_bytes());
                 let _trade: EquityTrade = serde_json::from_str(raw).unwrap();
             }
         });
@@ -170,12 +160,11 @@ fn bench_full_pipeline(c: &mut Criterion) {
     let arr_10 = server_array_10();
     group.throughput(Throughput::Elements(10));
     group.bench_function("batch_10_trades", |b| {
-        let data = arr_10.as_bytes();
         b.iter(|| {
-            let msgs: Vec<Box<serde_json::value::RawValue>> = serde_json::from_slice(data).unwrap();
+            let msgs: Vec<&serde_json::value::RawValue> = serde_json::from_str(&arr_10).unwrap();
             for raw_msg in &msgs {
                 let raw = raw_msg.get();
-                let _ = peek_ev_byte_scan(raw.as_bytes());
+                let _ = peek_event_type(raw.as_bytes());
                 let _trade: EquityTrade = serde_json::from_str(raw).unwrap();
             }
         });

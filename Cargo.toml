@@ -26,6 +26,9 @@ memchr = "2"
 # Inline small strings (avoids heap alloc for short fields)
 compact_str = { version = "0.9", features = ["serde"] }
 
+# Inline small vecs (avoids heap alloc for short condition/indicator arrays)
+smallvec = { version = "1", features = ["serde"] }
+
 # Error handling
 thiserror = "2"
 

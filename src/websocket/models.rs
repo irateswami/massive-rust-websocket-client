@@ -1,5 +1,6 @@
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 /// Control message for status and control events from the server.
 #[derive(Debug, Clone, Deserialize)]
@@ -92,7 +93,7 @@ pub struct EquityTrade {
     #[serde(rename = "s", default)]
     pub size: i64,
     #[serde(rename = "c", default)]
-    pub conditions: Vec<i32>,
+    pub conditions: SmallVec<[i32; 4]>,
     #[serde(rename = "t", default)]
     pub timestamp: i64,
     #[serde(rename = "q", default)]
@@ -119,7 +120,7 @@ pub struct CryptoTrade {
     #[serde(rename = "s", default)]
     pub size: f64,
     #[serde(rename = "c", default)]
-    pub conditions: Vec<i32>,
+    pub conditions: SmallVec<[i32; 4]>,
     #[serde(rename = "t", default)]
     pub timestamp: i64,
     #[serde(rename = "r", default)]
@@ -148,7 +149,7 @@ pub struct EquityQuote {
     #[serde(rename = "c", default)]
     pub condition: i32,
     #[serde(rename = "i", default)]
-    pub indicators: Vec<i32>,
+    pub indicators: SmallVec<[i32; 4]>,
     #[serde(rename = "t", default)]
     pub timestamp: i64,
     #[serde(rename = "z", default)]
@@ -234,7 +235,7 @@ pub struct LimitUpLimitDown {
     #[serde(rename = "l", default)]
     pub low_price: f64,
     #[serde(rename = "i", default)]
-    pub indicators: Vec<i32>,
+    pub indicators: SmallVec<[i32; 4]>,
     #[serde(rename = "z", default)]
     pub tape: i32,
     #[serde(rename = "t", default)]
@@ -407,7 +408,7 @@ mod tests {
         assert_eq!(trade.id, "trade123");
         assert_eq!(trade.price, 450.25);
         assert_eq!(trade.size, 100);
-        assert_eq!(trade.conditions, vec![14, 41]);
+        assert_eq!(trade.conditions.as_slice(), &[14, 41]);
         assert_eq!(trade.sequence_number, 42);
     }
 

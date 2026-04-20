@@ -6,13 +6,14 @@ use backoff::backoff::Backoff;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tungstenite::protocol::WebSocketConfig;
+use tungstenite::protocol::frame::Utf8Bytes;
 
 use crate::websocket::config::{Config, Market, Topic};
 use crate::websocket::error::ClientError;
@@ -20,8 +21,6 @@ use crate::websocket::models;
 use crate::websocket::subscription::{Subscriptions, build_subscribe_message};
 
 const WRITE_WAIT: Duration = Duration::from_secs(5);
-// TODO: implement pong deadline tracking (disconnect if no pong within this duration).
-#[allow(dead_code)]
 const PONG_WAIT: Duration = Duration::from_secs(30);
 const PING_PERIOD: Duration = Duration::from_secs(25);
 const MAX_MESSAGE_SIZE: usize = 1_000_000;
@@ -70,9 +69,10 @@ struct ClientInner {
     state: parking_lot::Mutex<ClientState>,
 
     // Read queue: read task → process task (survives reconnects via cloned sender).
-    rqueue_tx: mpsc::Sender<Bytes>,
+    // Uses Utf8Bytes to preserve the UTF-8 guarantee from tungstenite without re-validation.
+    rqueue_tx: mpsc::Sender<Utf8Bytes>,
     // Taken once by connect() to hand to the process task.
-    rqueue_rx: tokio::sync::Mutex<Option<mpsc::Receiver<Bytes>>>,
+    rqueue_rx: tokio::sync::Mutex<Option<mpsc::Receiver<Utf8Bytes>>>,
 
     // Output channels. Senders behind Option so close() can drop them.
     output_tx: parking_lot::Mutex<Option<mpsc::Sender<MarketData>>>,
@@ -313,15 +313,17 @@ fn do_connect(
         }
 
         let rw_token = tokio_util::sync::CancellationToken::new();
+        let pong_received = Arc::new(Notify::new());
 
         // Spawn read task.
         let rqueue_tx = inner.rqueue_tx.clone();
         let rt = rw_token.clone();
-        let read_handle = tokio::spawn(read_loop(read_half, rqueue_tx, rt));
+        let pong_tx = pong_received.clone();
+        let read_handle = tokio::spawn(read_loop(read_half, rqueue_tx, rt, pong_tx));
 
         // Spawn write task.
         let wt = rw_token.clone();
-        let write_handle = tokio::spawn(write_loop(write_half, wqueue_rx, wt));
+        let write_handle = tokio::spawn(write_loop(write_half, wqueue_rx, wt, pong_received));
 
         // Update shared state.
         {
@@ -456,8 +458,9 @@ fn close_internal(inner: &ClientInner) {
 
 async fn read_loop(
     mut read_half: futures_util::stream::SplitStream<WsStream>,
-    rqueue_tx: mpsc::Sender<Bytes>,
+    rqueue_tx: mpsc::Sender<Utf8Bytes>,
     token: tokio_util::sync::CancellationToken,
+    pong_notify: Arc<Notify>,
 ) {
     loop {
         tokio::select! {
@@ -465,18 +468,29 @@ async fn read_loop(
             msg = read_half.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        // Utf8Bytes → Bytes is O(1), unwraps the inner refcounted buffer.
-                        if rqueue_tx.send(text.into()).await.is_err() {
+                        // Utf8Bytes preserves tungstenite's UTF-8 guarantee through the channel.
+                        if rqueue_tx.send(text).await.is_err() {
                             break;
                         }
                     }
                     Some(Ok(Message::Binary(data))) => {
-                        if rqueue_tx.send(data).await.is_err() {
+                        // Binary frames are uncommon in this protocol; convert to Utf8Bytes.
+                        let text = match Utf8Bytes::try_from(data) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                tracing::error!("binary frame is not valid UTF-8: {e}");
+                                continue;
+                            }
+                        };
+                        if rqueue_tx.send(text).await.is_err() {
                             break;
                         }
                     }
-                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+                    Some(Ok(Message::Ping(_))) => {
                         // tungstenite auto-responds to pings
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        pong_notify.notify_one();
                     }
                     Some(Ok(Message::Close(_))) => {
                         tracing::debug!("received close frame");
@@ -502,9 +516,15 @@ async fn write_loop(
     mut write_half: futures_util::stream::SplitSink<WsStream, Message>,
     mut wqueue_rx: mpsc::Receiver<String>,
     token: tokio_util::sync::CancellationToken,
+    pong_notify: Arc<Notify>,
 ) {
     let mut ping_interval = tokio::time::interval(PING_PERIOD);
     ping_interval.tick().await; // skip the immediate first tick
+
+    // Pong deadline: armed after each ping, disarmed on pong receipt.
+    let pong_deadline = tokio::time::sleep(PONG_WAIT);
+    tokio::pin!(pong_deadline);
+    let mut pong_deadline_active = false;
 
     loop {
         tokio::select! {
@@ -518,6 +538,14 @@ async fn write_loop(
                 )).await;
                 break;
             }
+            _ = &mut pong_deadline, if pong_deadline_active => {
+                tracing::error!("pong deadline exceeded; disconnecting");
+                break;
+            }
+            _ = pong_notify.notified() => {
+                // Pong received — disarm the deadline.
+                pong_deadline_active = false;
+            }
             _ = ping_interval.tick() => {
                 let res = tokio::time::timeout(
                     WRITE_WAIT,
@@ -527,6 +555,9 @@ async fn write_loop(
                     tracing::error!("failed to send ping");
                     break;
                 }
+                // Arm the pong deadline.
+                pong_deadline.as_mut().reset(tokio::time::Instant::now() + PONG_WAIT);
+                pong_deadline_active = true;
             }
             msg = wqueue_rx.recv() => {
                 match msg {
@@ -551,7 +582,7 @@ async fn write_loop(
 }
 
 async fn process_loop(
-    mut rqueue_rx: mpsc::Receiver<Bytes>,
+    mut rqueue_rx: mpsc::Receiver<Utf8Bytes>,
     output_tx: mpsc::Sender<MarketData>,
     error_tx: mpsc::Sender<ClientError>,
     market: Market,
@@ -566,21 +597,16 @@ async fn process_loop(
                 let Some(data) = msg else { break };
 
                 if raw_data && bypass_raw_data_routing {
-                    let _ = output_tx.send(MarketData::Raw(data)).await;
+                    let _ = output_tx.send(MarketData::Raw(Bytes::from(data))).await;
                     continue;
                 }
 
-                let msgs: Vec<Box<serde_json::value::RawValue>> =
-                    match serde_json::from_slice(&data) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::error!("failed to parse message array: {e}");
-                            continue;
-                        }
-                    };
+                // Utf8Bytes guarantees valid UTF-8 (validated by tungstenite on receipt).
+                let str_data: &str = &data;
 
-                for raw_msg in &msgs {
-                    let event_type = match peek_event_type(raw_msg.get().as_bytes()) {
+                // Zero-alloc iteration over JSON array elements.
+                for raw_element in json_array_elements(str_data) {
+                    let event_type = match peek_event_type(raw_element.as_bytes()) {
                         Some(ev) => ev,
                         None => {
                             tracing::error!("failed to extract event type from message");
@@ -590,7 +616,7 @@ async fn process_loop(
 
                     match event_type {
                         "status" => {
-                            if let Err(e) = handle_status(raw_msg.get()) {
+                            if let Err(e) = handle_status(raw_element) {
                                 let _ = error_tx.send(e).await;
                                 return; // fatal
                             }
@@ -598,12 +624,12 @@ async fn process_loop(
                         _ => {
                             if raw_data {
                                 let _ = output_tx
-                                    .send(MarketData::Raw(
-                                        Bytes::copy_from_slice(raw_msg.get().as_bytes()),
-                                    ))
+                                    .send(MarketData::Raw(Bytes::copy_from_slice(
+                                        raw_element.as_bytes(),
+                                    )))
                                     .await;
                             } else {
-                                match route_data(&market, event_type, raw_msg.get()) {
+                                match route_data(&market, event_type, raw_element) {
                                     Ok(Some(market_data)) => {
                                         let _ = output_tx.send(market_data).await;
                                     }
@@ -631,6 +657,79 @@ pub fn peek_event_type(raw: &[u8]) -> Option<&str> {
     let start = pos + needle.len();
     let end = start + memchr::memchr(b'"', &raw[start..])?;
     std::str::from_utf8(&raw[start..end]).ok()
+}
+
+/// Zero-allocation iterator over elements in a JSON array string.
+///
+/// Scans for object boundaries by tracking brace depth, correctly handling
+/// strings with escaped characters. Yields `&str` slices of each element.
+/// Avoids the `Vec<&RawValue>` allocation entirely.
+pub fn json_array_elements(input: &str) -> JsonArrayIter<'_> {
+    let data = input.as_bytes();
+    // Skip past the opening '[' of the outer array.
+    let start = memchr::memchr(b'[', data).map(|p| p + 1).unwrap_or(0);
+    JsonArrayIter { data, pos: start }
+}
+
+pub struct JsonArrayIter<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Iterator for JsonArrayIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let data = self.data;
+        let len = data.len();
+
+        // Skip whitespace/commas to the start of the next element.
+        while self.pos < len {
+            match data[self.pos] {
+                b'{' => break,
+                b']' => return None, // end of array
+                _ => self.pos += 1,
+            }
+        }
+
+        if self.pos >= len {
+            return None;
+        }
+
+        let start = self.pos;
+        let mut depth: u32 = 0;
+        let mut in_string = false;
+
+        while self.pos < len {
+            let b = data[self.pos];
+            if in_string {
+                if b == b'\\' {
+                    self.pos += 1; // skip escaped character
+                } else if b == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match b {
+                    b'"' => in_string = true,
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            self.pos += 1;
+                            // SAFETY: input was &str so all byte boundaries are valid UTF-8.
+                            let element =
+                                unsafe { std::str::from_utf8_unchecked(&data[start..self.pos]) };
+                            return Some(element);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            self.pos += 1;
+        }
+
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

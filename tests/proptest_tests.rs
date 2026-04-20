@@ -119,7 +119,6 @@ proptest! {
 // Property: serialization round-trips are lossless
 // ---------------------------------------------------------------------------
 
-
 /// Strategy for generating wire-format JSON trade payloads (as they arrive from the server).
 fn wire_trade_json_strategy() -> impl Strategy<Value = String> {
     (

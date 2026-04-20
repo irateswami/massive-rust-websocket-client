@@ -59,11 +59,8 @@ async fn start_blast_server() -> String {
 
                 // Wait for auth.
                 if let Some(Ok(_)) = read.next().await {
-                    let auth_ok =
-                        serde_json::json!([{"ev": "status", "status": "auth_success"}]);
-                    let _ = write
-                        .send(Message::Text(auth_ok.to_string().into()))
-                        .await;
+                    let auth_ok = serde_json::json!([{"ev": "status", "status": "auth_success"}]);
+                    let _ = write.send(Message::Text(auth_ok.to_string().into())).await;
                 }
 
                 // Wait for subscribe.
@@ -71,9 +68,7 @@ async fn start_blast_server() -> String {
                     let sub_ok = serde_json::json!([
                         {"ev": "status", "status": "success", "message": "subscribed"}
                     ]);
-                    let _ = write
-                        .send(Message::Text(sub_ok.to_string().into()))
-                        .await;
+                    let _ = write.send(Message::Text(sub_ok.to_string().into())).await;
 
                     // Blast all batches as fast as possible.
                     for batch_idx in 0..NUM_BATCHES {
@@ -158,8 +153,7 @@ fn bench_throughput(c: &mut Criterion) {
             // Report stats (visible in criterion's verbose output).
             if !latencies.is_empty() {
                 let total_time = *latencies.last().unwrap();
-                let msgs_per_sec =
-                    latencies.len() as f64 / total_time.as_secs_f64();
+                let msgs_per_sec = latencies.len() as f64 / total_time.as_secs_f64();
 
                 // p99 latency: time from start until the p99th message arrives.
                 let p99_idx = (latencies.len() as f64 * 0.99) as usize;

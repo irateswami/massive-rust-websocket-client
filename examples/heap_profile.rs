@@ -11,8 +11,9 @@
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use massive_rust_client::websocket::models::*;
+use massive_rust_client::websocket::{json_array_elements, peek_event_type};
 
-/// Simulates the process loop hot path: array parse → ev peek → deser.
+/// Simulates the process loop hot path: array iterate → ev peek → deser.
 fn simulate_hot_path(iterations: usize) {
     // Realistic server message: array of 5 mixed events.
     let server_msg = r#"[
@@ -24,15 +25,10 @@ fn simulate_hot_path(iterations: usize) {
     ]"#;
 
     for _ in 0..iterations {
-        // Step 1: parse outer array (same as process_loop)
-        let msgs: Vec<Box<serde_json::value::RawValue>> = serde_json::from_str(server_msg).unwrap();
-
-        for raw_msg in &msgs {
-            let raw = raw_msg.get();
-
-            // Step 2: peek at "ev" field
-            let ev: serde_json::Value = serde_json::from_str(raw).unwrap();
-            let event_type = ev.get("ev").and_then(|v| v.as_str()).unwrap_or("");
+        // Step 1: zero-alloc iteration over JSON array elements (matches actual process_loop)
+        for raw in json_array_elements(server_msg) {
+            // Step 2: peek at "ev" field (zero-alloc byte scan)
+            let event_type = peek_event_type(raw.as_bytes()).unwrap_or("");
 
             // Step 3: full deserialization based on event type
             match event_type {
