@@ -1,0 +1,81 @@
+[package]
+name = "massive-rust-client"
+version = "0.1.0"
+edition = "2024"
+description = "WebSocket client library for Massive.com real-time market data APIs"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time", "macros", "signal"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+tungstenite = "0.29"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+
+# Zero-copy bytes
+bytes = "1"
+
+# Fast byte scanning
+memchr = "2"
+
+# Inline small strings (avoids heap alloc for short fields)
+compact_str = { version = "0.9", features = ["serde"] }
+
+# Error handling
+thiserror = "2"
+
+# Structured logging
+tracing = "0.1"
+
+# Async stream utilities (SinkExt, StreamExt)
+futures-util = "0.3"
+
+# Cancellation tokens
+tokio-util = "0.7"
+
+# Mutex
+parking_lot = "0.12"
+
+# Reconnection backoff
+backoff = { version = "0.4", features = ["tokio"] }
+
+# Optional: tokio-console runtime profiling
+console-subscriber = { version = "0.4", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["async_tokio"] }
+dhat = "0.3"
+loom = "0.7"
+proptest = "1"
+stats_alloc = "0.1"
+# Used by examples for logging setup
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[features]
+dhat-heap = []
+tokio-console = ["dep:console-subscriber"]
+
+[[bench]]
+name = "benchmarks"
+harness = false
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[example]]
+name = "stocks"
+path = "examples/stocks.rs"
+
+[[example]]
+name = "fmv"
+path = "examples/fmv.rs"
+
+[[example]]
+name = "launchpad"
+path = "examples/launchpad.rs"

@@ -1,0 +1,28 @@
+[package]
+name = "massive-rust-client-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+[dependencies.massive-rust-client]
+path = ".."
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_peek_event_type"
+path = "fuzz_targets/fuzz_peek_event_type.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_json_deser"
+path = "fuzz_targets/fuzz_json_deser.rs"
+doc = false

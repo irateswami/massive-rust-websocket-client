@@ -1,0 +1,1514 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use backoff::ExponentialBackoff;
+use backoff::backoff::Backoff;
+use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tungstenite::protocol::WebSocketConfig;
+
+use crate::websocket::config::{Config, Market, Topic};
+use crate::websocket::error::ClientError;
+use crate::websocket::models;
+use crate::websocket::subscription::{Subscriptions, build_subscribe_message};
+
+const WRITE_WAIT: Duration = Duration::from_secs(5);
+// TODO: implement pong deadline tracking (disconnect if no pong within this duration).
+#[allow(dead_code)]
+const PONG_WAIT: Duration = Duration::from_secs(30);
+const PING_PERIOD: Duration = Duration::from_secs(25);
+const MAX_MESSAGE_SIZE: usize = 1_000_000;
+
+// Type aliases for the verbose WebSocket types.
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Tagged enum for all market data types output by the client.
+#[derive(Debug, Clone)]
+pub enum MarketData {
+    EquityAgg(models::EquityAgg),
+    EquityTrade(models::EquityTrade),
+    EquityQuote(models::EquityQuote),
+    Imbalance(models::Imbalance),
+    LimitUpLimitDown(models::LimitUpLimitDown),
+    CurrencyAgg(models::CurrencyAgg),
+    ForexQuote(models::ForexQuote),
+    CryptoTrade(models::CryptoTrade),
+    CryptoQuote(models::CryptoQuote),
+    Level2Book(models::Level2Book),
+    IndexValue(models::IndexValue),
+    FairMarketValue(models::FairMarketValue),
+    LaunchpadValue(models::LaunchpadValue),
+    FuturesAggregate(models::FuturesAggregate),
+    FuturesTrade(models::FuturesTrade),
+    FuturesQuote(models::FuturesQuote),
+    Raw(Bytes),
+}
+
+/// Client for the Massive WebSocket API.
+///
+/// Provides real-time streaming of trades, quotes, aggregates, and more
+/// across Stocks, Options, Forex, Crypto, Indices, and Futures markets.
+pub struct Client {
+    inner: Arc<ClientInner>,
+}
+
+struct ClientInner {
+    api_key: String,
+    market: Market,
+    url: String,
+    raw_data: bool,
+    bypass_raw_data_routing: bool,
+    max_retries: Option<u64>,
+
+    state: parking_lot::Mutex<ClientState>,
+
+    // Read queue: read task → process task (survives reconnects via cloned sender).
+    rqueue_tx: mpsc::Sender<Bytes>,
+    // Taken once by connect() to hand to the process task.
+    rqueue_rx: tokio::sync::Mutex<Option<mpsc::Receiver<Bytes>>>,
+
+    // Output channels. Senders behind Option so close() can drop them.
+    output_tx: parking_lot::Mutex<Option<mpsc::Sender<MarketData>>>,
+    error_tx: parking_lot::Mutex<Option<mpsc::Sender<ClientError>>>,
+
+    // Process task lifecycle (survives reconnects, cancelled on close).
+    proc_token: tokio_util::sync::CancellationToken,
+
+    reconnect_callback: Option<Box<dyn Fn(Option<&ClientError>) + Send + Sync>>,
+}
+
+struct ClientState {
+    connected: bool,
+    should_close: bool,
+    subs: Subscriptions,
+    wqueue_tx: Option<mpsc::Sender<String>>,
+    rw_token: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl Client {
+    /// Creates a new client for the Massive WebSocket API.
+    ///
+    /// Returns the client along with receivers for market data output and errors.
+    pub fn new(
+        config: Config,
+    ) -> Result<
+        (
+            Self,
+            mpsc::Receiver<MarketData>,
+            mpsc::Receiver<ClientError>,
+        ),
+        ClientError,
+    > {
+        config.validate()?;
+
+        let url = config.build_url();
+        let (rqueue_tx, rqueue_rx) = mpsc::channel(10_000);
+        let (output_tx, output_rx) = mpsc::channel(100_000);
+        let (error_tx, error_rx) = mpsc::channel(1);
+
+        let inner = Arc::new(ClientInner {
+            api_key: config.api_key,
+            market: config.market,
+            url,
+            raw_data: config.raw_data,
+            bypass_raw_data_routing: config.bypass_raw_data_routing,
+            max_retries: config.max_retries,
+            state: parking_lot::Mutex::new(ClientState {
+                connected: false,
+                should_close: false,
+                subs: Subscriptions::new(),
+                wqueue_tx: None,
+                rw_token: None,
+            }),
+            rqueue_tx,
+            rqueue_rx: tokio::sync::Mutex::new(Some(rqueue_rx)),
+            output_tx: parking_lot::Mutex::new(Some(output_tx)),
+            error_tx: parking_lot::Mutex::new(Some(error_tx)),
+            proc_token: tokio_util::sync::CancellationToken::new(),
+            reconnect_callback: config.reconnect_callback,
+        });
+
+        Ok((Client { inner }, output_rx, error_rx))
+    }
+
+    /// Dials the WebSocket server and starts streaming. Any subscriptions
+    /// pushed before connecting will be sent after authentication.
+    pub async fn connect(&self) -> Result<(), ClientError> {
+        let rqueue_rx = self
+            .inner
+            .rqueue_rx
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| ClientError::InvalidConfig("already connected".into()))?;
+
+        // Initial connection with backoff.
+        do_connect(self.inner.clone(), false).await?;
+
+        // Spawn the process task (lives for the lifetime of the client).
+        let output_tx = self
+            .inner
+            .output_tx
+            .lock()
+            .as_ref()
+            .ok_or_else(|| ClientError::InvalidConfig("client closed".into()))?
+            .clone();
+        let error_tx = self
+            .inner
+            .error_tx
+            .lock()
+            .as_ref()
+            .ok_or_else(|| ClientError::InvalidConfig("client closed".into()))?
+            .clone();
+
+        let market = self.inner.market;
+        let raw_data = self.inner.raw_data;
+        let bypass = self.inner.bypass_raw_data_routing;
+        let proc_token = self.inner.proc_token.clone();
+
+        tokio::spawn(async move {
+            process_loop(
+                rqueue_rx, output_tx, error_tx, market, raw_data, bypass, proc_token,
+            )
+            .await;
+        });
+
+        Ok(())
+    }
+
+    /// Subscribes to a topic for the given tickers. If no tickers are provided,
+    /// subscribes to all tickers for that topic.
+    pub async fn subscribe(&self, topic: Topic, tickers: &[&str]) -> Result<(), ClientError> {
+        let mut state = self.inner.state.lock();
+
+        if !self.inner.market.supports(&topic) {
+            return Err(ClientError::UnsupportedTopic(topic, self.inner.market));
+        }
+
+        let tickers: Vec<String> = if tickers.is_empty() || tickers.contains(&"*") {
+            vec!["*".to_string()]
+        } else {
+            tickers.iter().map(|s| s.to_string()).collect()
+        };
+
+        let msg = build_subscribe_message("subscribe", topic, &tickers)?;
+        state.subs.add(topic, &tickers);
+
+        if let Some(tx) = &state.wqueue_tx {
+            let _ = tx.try_send(msg);
+        }
+
+        Ok(())
+    }
+
+    /// Unsubscribes from a topic for the given tickers. If no tickers are provided,
+    /// unsubscribes from all cached tickers for that topic.
+    pub async fn unsubscribe(&self, topic: Topic, tickers: &[&str]) -> Result<(), ClientError> {
+        let mut state = self.inner.state.lock();
+
+        if !self.inner.market.supports(&topic) {
+            return Err(ClientError::UnsupportedTopic(topic, self.inner.market));
+        }
+
+        let tickers: Vec<String> = if tickers.is_empty() || tickers.contains(&"*") {
+            state.subs.get_tickers(&topic)
+        } else {
+            tickers.iter().map(|s| s.to_string()).collect()
+        };
+
+        let msg = build_subscribe_message("unsubscribe", topic, &tickers)?;
+        state.subs.delete(topic, &tickers);
+
+        if let Some(tx) = &state.wqueue_tx {
+            let _ = tx.try_send(msg);
+        }
+
+        Ok(())
+    }
+
+    /// Gracefully closes the connection.
+    pub async fn close(&self) {
+        {
+            let mut state = self.inner.state.lock();
+            if state.should_close {
+                return;
+            }
+            state.should_close = true;
+            state.wqueue_tx = None;
+            if let Some(token) = state.rw_token.take() {
+                token.cancel();
+            }
+        }
+
+        self.inner.proc_token.cancel();
+
+        // Drop output/error senders to close the channels.
+        *self.inner.output_tx.lock() = None;
+        *self.inner.error_tx.lock() = None;
+
+        tracing::debug!("client closed");
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        let mut state = self.inner.state.lock();
+        state.should_close = true;
+        state.wqueue_tx = None;
+        if let Some(token) = state.rw_token.take() {
+            token.cancel();
+        }
+        self.inner.proc_token.cancel();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection management
+// ---------------------------------------------------------------------------
+
+fn do_connect(
+    inner: Arc<ClientInner>,
+    reconnect: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ClientError>> + Send>> {
+    Box::pin(async move {
+        let mut ws_config = WebSocketConfig::default();
+        ws_config.max_message_size = Some(MAX_MESSAGE_SIZE);
+
+        let (ws_stream, _) =
+            tokio_tungstenite::connect_async_with_config(&inner.url, Some(ws_config), false)
+                .await?;
+
+        tracing::debug!("connected to {}", inner.url);
+
+        let (write_half, read_half) = ws_stream.split();
+
+        // New write queue per connection (matches Go behavior).
+        let (wqueue_tx, wqueue_rx) = mpsc::channel::<String>(1_000);
+
+        // Send auth message.
+        let auth_msg = serde_json::to_string(&serde_json::json!({
+            "action": "auth",
+            "params": &inner.api_key,
+        }))
+        .map_err(ClientError::Json)?;
+        wqueue_tx
+            .send(auth_msg)
+            .await
+            .map_err(|_| ClientError::ChannelClosed)?;
+
+        // Replay cached subscriptions.
+        let sub_msgs = inner.state.lock().subs.get_messages();
+        for msg in sub_msgs {
+            wqueue_tx
+                .send(msg)
+                .await
+                .map_err(|_| ClientError::ChannelClosed)?;
+        }
+
+        let rw_token = tokio_util::sync::CancellationToken::new();
+
+        // Spawn read task.
+        let rqueue_tx = inner.rqueue_tx.clone();
+        let rt = rw_token.clone();
+        let read_handle = tokio::spawn(read_loop(read_half, rqueue_tx, rt));
+
+        // Spawn write task.
+        let wt = rw_token.clone();
+        let write_handle = tokio::spawn(write_loop(write_half, wqueue_rx, wt));
+
+        // Update shared state.
+        {
+            let mut state = inner.state.lock();
+            state.wqueue_tx = Some(wqueue_tx);
+            state.rw_token = Some(rw_token.clone());
+            state.connected = true;
+        }
+
+        // Spawn connection monitor (detects disconnect, triggers reconnect).
+        if !reconnect {
+            let monitor_inner = inner.clone();
+            tokio::spawn(connection_monitor(
+                monitor_inner,
+                read_handle,
+                write_handle,
+                rw_token,
+            ));
+        } else {
+            // On reconnect the existing monitor is gone; spawn a new one.
+            let monitor_inner = inner.clone();
+            tokio::spawn(connection_monitor(
+                monitor_inner,
+                read_handle,
+                write_handle,
+                rw_token,
+            ));
+        }
+
+        Ok(())
+    }) // Box::pin
+}
+
+/// Watches the read/write tasks; on unexpected exit, triggers reconnection.
+async fn connection_monitor(
+    inner: Arc<ClientInner>,
+    read_handle: JoinHandle<()>,
+    write_handle: JoinHandle<()>,
+    rw_token: tokio_util::sync::CancellationToken,
+) {
+    // Wait for either task to exit.
+    tokio::select! {
+        _ = read_handle => {
+            tracing::debug!("read task exited");
+        }
+        _ = write_handle => {
+            tracing::debug!("write task exited");
+        }
+    }
+
+    // Cancel the surviving task.
+    rw_token.cancel();
+
+    let should_close = inner.state.lock().should_close;
+    if should_close {
+        return;
+    }
+
+    tracing::debug!("unexpected disconnect: reconnecting");
+
+    // Reconnect with exponential backoff.
+    let mut backoff = ExponentialBackoff {
+        max_elapsed_time: None, // retry until max_retries or forever
+        ..Default::default()
+    };
+
+    let mut attempts = 0u64;
+
+    loop {
+        match do_connect(inner.clone(), true).await {
+            Ok(()) => {
+                tracing::debug!("reconnection successful");
+                if let Some(ref cb) = inner.reconnect_callback {
+                    cb(None);
+                }
+                return;
+            }
+            Err(e) => {
+                attempts += 1;
+                tracing::error!("reconnect attempt {attempts} failed: {e}");
+
+                if let Some(ref cb) = inner.reconnect_callback {
+                    cb(Some(&e));
+                }
+
+                if let Some(max) = inner.max_retries {
+                    if attempts >= max {
+                        tracing::error!("max reconnection attempts exceeded");
+                        close_internal(&inner);
+                        if let Some(tx) = inner.error_tx.lock().as_ref() {
+                            let _ = tx.try_send(ClientError::MaxRetriesExceeded);
+                        }
+                        return;
+                    }
+                }
+
+                match backoff.next_backoff() {
+                    Some(duration) => {
+                        tracing::debug!("retrying in {duration:?}");
+                        tokio::time::sleep(duration).await;
+                    }
+                    None => {
+                        tracing::error!("backoff exhausted");
+                        close_internal(&inner);
+                        if let Some(tx) = inner.error_tx.lock().as_ref() {
+                            let _ = tx.try_send(ClientError::MaxRetriesExceeded);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn close_internal(inner: &ClientInner) {
+    let mut state = inner.state.lock();
+    state.should_close = true;
+    state.wqueue_tx = None;
+    if let Some(token) = state.rw_token.take() {
+        token.cancel();
+    }
+    drop(state);
+    inner.proc_token.cancel();
+    *inner.output_tx.lock() = None;
+    *inner.error_tx.lock() = None;
+}
+
+// ---------------------------------------------------------------------------
+// Task loops
+// ---------------------------------------------------------------------------
+
+async fn read_loop(
+    mut read_half: futures_util::stream::SplitStream<WsStream>,
+    rqueue_tx: mpsc::Sender<Bytes>,
+    token: tokio_util::sync::CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            msg = read_half.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        // Utf8Bytes → Bytes is O(1), unwraps the inner refcounted buffer.
+                        if rqueue_tx.send(text.into()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Binary(data))) => {
+                        if rqueue_tx.send(data).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+                        // tungstenite auto-responds to pings
+                    }
+                    Some(Ok(Message::Close(_))) => {
+                        tracing::debug!("received close frame");
+                        break;
+                    }
+                    Some(Ok(Message::Frame(_))) => {}
+                    Some(Err(e)) => {
+                        tracing::error!("websocket read error: {e}");
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // Signal disconnect so the monitor triggers reconnection.
+    token.cancel();
+    tracing::debug!("read task closed");
+}
+
+async fn write_loop(
+    mut write_half: futures_util::stream::SplitSink<WsStream, Message>,
+    mut wqueue_rx: mpsc::Receiver<String>,
+    token: tokio_util::sync::CancellationToken,
+) {
+    let mut ping_interval = tokio::time::interval(PING_PERIOD);
+    ping_interval.tick().await; // skip the immediate first tick
+
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => {
+                // Attempt a graceful close frame (best-effort).
+                let _ = tokio::time::timeout(WRITE_WAIT, write_half.send(
+                    Message::Close(Some(CloseFrame {
+                        code: CloseCode::Normal,
+                        reason: "".into(),
+                    }))
+                )).await;
+                break;
+            }
+            _ = ping_interval.tick() => {
+                let res = tokio::time::timeout(
+                    WRITE_WAIT,
+                    write_half.send(Message::Ping(Vec::new().into())),
+                ).await;
+                if res.is_err() || res.unwrap().is_err() {
+                    tracing::error!("failed to send ping");
+                    break;
+                }
+            }
+            msg = wqueue_rx.recv() => {
+                match msg {
+                    Some(data) => {
+                        let res = tokio::time::timeout(
+                            WRITE_WAIT,
+                            write_half.send(Message::Text(data.into())),
+                        ).await;
+                        if res.is_err() || res.unwrap().is_err() {
+                            tracing::error!("failed to send message");
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    token.cancel();
+    tracing::debug!("write task closed");
+}
+
+async fn process_loop(
+    mut rqueue_rx: mpsc::Receiver<Bytes>,
+    output_tx: mpsc::Sender<MarketData>,
+    error_tx: mpsc::Sender<ClientError>,
+    market: Market,
+    raw_data: bool,
+    bypass_raw_data_routing: bool,
+    proc_token: tokio_util::sync::CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = proc_token.cancelled() => break,
+            msg = rqueue_rx.recv() => {
+                let Some(data) = msg else { break };
+
+                if raw_data && bypass_raw_data_routing {
+                    let _ = output_tx.send(MarketData::Raw(data)).await;
+                    continue;
+                }
+
+                let msgs: Vec<Box<serde_json::value::RawValue>> =
+                    match serde_json::from_slice(&data) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!("failed to parse message array: {e}");
+                            continue;
+                        }
+                    };
+
+                for raw_msg in &msgs {
+                    let event_type = match peek_event_type(raw_msg.get().as_bytes()) {
+                        Some(ev) => ev,
+                        None => {
+                            tracing::error!("failed to extract event type from message");
+                            continue;
+                        }
+                    };
+
+                    match event_type {
+                        "status" => {
+                            if let Err(e) = handle_status(raw_msg.get()) {
+                                let _ = error_tx.send(e).await;
+                                return; // fatal
+                            }
+                        }
+                        _ => {
+                            if raw_data {
+                                let _ = output_tx
+                                    .send(MarketData::Raw(
+                                        Bytes::copy_from_slice(raw_msg.get().as_bytes()),
+                                    ))
+                                    .await;
+                            } else {
+                                match route_data(&market, event_type, raw_msg.get()) {
+                                    Ok(Some(market_data)) => {
+                                        let _ = output_tx.send(market_data).await;
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        tracing::error!("deserialization error: {e}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::debug!("process task closed");
+}
+
+/// Extracts the `"ev"` field value from raw JSON bytes using a fast byte scan.
+/// Avoids a full serde parse — ~227x faster than the serde EventType approach.
+pub fn peek_event_type(raw: &[u8]) -> Option<&str> {
+    let needle = b"\"ev\":\"";
+    let pos = memchr::memmem::find(raw, needle)?;
+    let start = pos + needle.len();
+    let end = start + memchr::memchr(b'"', &raw[start..])?;
+    std::str::from_utf8(&raw[start..end]).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Message routing
+// ---------------------------------------------------------------------------
+
+fn handle_status(raw: &str) -> Result<(), ClientError> {
+    let cm: models::ControlMessage = match serde_json::from_str(raw) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("failed to unmarshal status message: {e}");
+            return Ok(());
+        }
+    };
+
+    match cm.status.as_str() {
+        "connected" => tracing::debug!("connection successful"),
+        "auth_success" => tracing::debug!("authentication successful"),
+        "auth_failed" => {
+            return Err(ClientError::AuthFailed(
+                "authentication failed: closing connection".into(),
+            ));
+        }
+        "success" => tracing::debug!("status success: {}", sanitize(&cm.message)),
+        "error" => tracing::error!("status error: {}", sanitize(&cm.message)),
+        other => tracing::info!(
+            "unknown status '{}': {}",
+            sanitize(other),
+            sanitize(&cm.message)
+        ),
+    }
+
+    Ok(())
+}
+
+fn route_data(
+    market: &Market,
+    event_type: &str,
+    raw: &str,
+) -> Result<Option<MarketData>, serde_json::Error> {
+    macro_rules! deser {
+        ($variant:ident) => {{
+            let v = serde_json::from_str(raw)?;
+            Ok(Some(MarketData::$variant(v)))
+        }};
+    }
+
+    // Cross-market types checked first.
+    match event_type {
+        "FMV" => return deser!(FairMarketValue),
+        "LV" => return deser!(LaunchpadValue),
+        _ => {}
+    }
+
+    match market {
+        Market::Stocks => match event_type {
+            "A" | "AM" => deser!(EquityAgg),
+            "T" => deser!(EquityTrade),
+            "Q" => deser!(EquityQuote),
+            "LULD" => deser!(LimitUpLimitDown),
+            "NOI" => deser!(Imbalance),
+            _ => {
+                tracing::info!("unknown message type '{event_type}' for market {market}");
+                Ok(None)
+            }
+        },
+        Market::Options => match event_type {
+            "A" | "AM" => deser!(EquityAgg),
+            "T" => deser!(EquityTrade),
+            "Q" => deser!(EquityQuote),
+            _ => {
+                tracing::info!("unknown message type '{event_type}' for market {market}");
+                Ok(None)
+            }
+        },
+        Market::Forex => match event_type {
+            "CA" | "CAS" => deser!(CurrencyAgg),
+            "C" => deser!(ForexQuote),
+            _ => {
+                tracing::info!("unknown message type '{event_type}' for market {market}");
+                Ok(None)
+            }
+        },
+        Market::Crypto => match event_type {
+            "XA" | "XAS" => deser!(CurrencyAgg),
+            "XT" => deser!(CryptoTrade),
+            "XQ" => deser!(CryptoQuote),
+            "XL2" => deser!(Level2Book),
+            _ => {
+                tracing::info!("unknown message type '{event_type}' for market {market}");
+                Ok(None)
+            }
+        },
+        Market::Indices => match event_type {
+            "A" | "AM" => deser!(EquityAgg),
+            "V" => deser!(IndexValue),
+            _ => {
+                tracing::info!("unknown message type '{event_type}' for market {market}");
+                Ok(None)
+            }
+        },
+        Market::Futures
+        | Market::FuturesCme
+        | Market::FuturesCbot
+        | Market::FuturesNymex
+        | Market::FuturesComex => match event_type {
+            "A" | "AM" => deser!(FuturesAggregate),
+            "T" => deser!(FuturesTrade),
+            "Q" => deser!(FuturesQuote),
+            _ => {
+                tracing::info!("unknown message type '{event_type}' for market {market}");
+                Ok(None)
+            }
+        },
+    }
+}
+
+fn sanitize(s: &str) -> String {
+    s.replace('\n', "")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::websocket::config::{Config, Feed};
+    use futures_util::SinkExt;
+    use tokio::net::TcpListener;
+
+    /// Spins up a mock WebSocket server that echoes back auth success/failure.
+    /// Matches the Go test server in client_test.go.
+    async fn mock_ws_server() -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://127.0.0.1:{}", addr.port());
+
+        let handle = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let ws = match tokio_tungstenite::accept_async(stream).await {
+                        Ok(ws) => ws,
+                        Err(_) => return,
+                    };
+                    let (mut write, mut read) = ws.split();
+
+                    while let Some(Ok(msg)) = read.next().await {
+                        if let Message::Text(text) = msg {
+                            let cm: serde_json::Value = match serde_json::from_str(text.as_ref()) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+
+                            if cm["action"] == "auth" && cm["params"] == "good" {
+                                let res = serde_json::json!([
+                                    {"ev": "status", "status": "auth_success"}
+                                ]);
+                                let _ = write.send(Message::Text(res.to_string().into())).await;
+                            } else if cm["action"] == "auth" {
+                                let res = serde_json::json!([
+                                    {"ev": "status", "status": "auth_failed"}
+                                ]);
+                                let _ = write.send(Message::Text(res.to_string().into())).await;
+                            } else if cm["action"] == "subscribe" {
+                                let res = serde_json::json!([
+                                    {"ev": "status", "status": "success", "message": "subscribed"}
+                                ]);
+                                let _ = write.send(Message::Text(res.to_string().into())).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        (url, handle)
+    }
+
+    fn test_config(api_key: &str, url: String) -> Config {
+        Config {
+            api_key: api_key.into(),
+            feed: Feed::RealTime,
+            market: Market::Stocks,
+            max_retries: Some(0),
+            raw_data: false,
+            bypass_raw_data_routing: false,
+            reconnect_callback: None,
+            url_override: Some(url),
+        }
+    }
+
+    // --- Port of TestNew ---
+
+    #[test]
+    fn test_new_success() {
+        let config = Config {
+            api_key: "test".into(),
+            feed: Feed::PolyFeed,
+            market: Market::Options,
+            max_retries: None,
+            raw_data: false,
+            bypass_raw_data_routing: false,
+            reconnect_callback: None,
+            url_override: None,
+        };
+        let (client, _output, _errors) = Client::new(config).unwrap();
+        assert_eq!(client.inner.url, "wss://polyfeed.massive.com/options");
+    }
+
+    #[test]
+    fn test_new_empty_config() {
+        let config = Config {
+            api_key: "".into(),
+            feed: Feed::RealTime,
+            market: Market::Stocks,
+            max_retries: None,
+            raw_data: false,
+            bypass_raw_data_routing: false,
+            reconnect_callback: None,
+            url_override: None,
+        };
+        assert!(Client::new(config).is_err());
+    }
+
+    // --- Port of TestConnectAuthSuccess ---
+
+    #[tokio::test]
+    async fn test_connect_auth_success() {
+        let (url, _server) = mock_ws_server().await;
+        let config = test_config("good", url);
+        let (client, _output, _errors) = Client::new(config).unwrap();
+
+        // Close before connect should be fine.
+        client.close().await;
+
+        // Create a fresh client to actually connect.
+        let (url2, _server2) = mock_ws_server().await;
+        let config2 = test_config("good", url2);
+        let (client2, _output2, _errors2) = Client::new(config2).unwrap();
+
+        let result = client2.connect().await;
+        assert!(result.is_ok());
+
+        // Give auth response time to propagate.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        client2.close().await;
+    }
+
+    // --- Port of TestConnectAuthFailure ---
+
+    #[tokio::test]
+    async fn test_connect_auth_failure() {
+        let (url, _server) = mock_ws_server().await;
+        let config = test_config("bad", url);
+        let (client, _output, mut errors) = Client::new(config).unwrap();
+
+        let result = client.connect().await;
+        assert!(result.is_ok()); // connect itself succeeds; auth fail arrives async
+
+        // Should receive an auth error on the error channel.
+        let err = tokio::time::timeout(Duration::from_secs(2), errors.recv()).await;
+        assert!(err.is_ok());
+        let err = err.unwrap().unwrap();
+        assert!(matches!(err, ClientError::AuthFailed(_)));
+
+        client.close().await;
+    }
+
+    // --- Port of TestConnectRetryFailure ---
+
+    #[tokio::test]
+    async fn test_connect_retry_failure() {
+        // Connect to a wss:// URL against a plain ws server — should fail.
+        let config = Config {
+            api_key: "test".into(),
+            feed: Feed::RealTime,
+            market: Market::Stocks,
+            max_retries: Some(1),
+            raw_data: false,
+            bypass_raw_data_routing: false,
+            reconnect_callback: None,
+            url_override: Some("wss://127.0.0.1:1".into()), // bad address
+        };
+        let (client, _output, _errors) = Client::new(config).unwrap();
+        let result = client.connect().await;
+        assert!(result.is_err());
+        client.close().await;
+    }
+
+    // --- Port of TestReconnectCallback ---
+
+    #[tokio::test]
+    async fn test_reconnect_callback() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://127.0.0.1:{}", addr.port());
+
+        // Server that accepts multiple connections and always auth-succeeds.
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    let (mut write, mut read) = ws.split();
+                    while let Some(Ok(msg)) = read.next().await {
+                        if let Message::Text(text) = msg {
+                            let cm: serde_json::Value = match serde_json::from_str(text.as_ref()) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            if cm["action"] == "auth" && cm["params"] == "good" {
+                                let res = serde_json::json!([
+                                    {"ev": "status", "status": "auth_success"}
+                                ]);
+                                let _ = write.send(Message::Text(res.to_string().into())).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let callback_count = StdArc::new(AtomicU32::new(0));
+        let cb_count = callback_count.clone();
+
+        let config = Config {
+            api_key: "good".into(),
+            feed: Feed::RealTime,
+            market: Market::Stocks,
+            max_retries: Some(2),
+            raw_data: false,
+            bypass_raw_data_routing: false,
+            reconnect_callback: Some(Box::new(move |err| {
+                // On successful reconnect, err is None.
+                assert!(err.is_none());
+                cb_count.fetch_add(1, Ordering::SeqCst);
+            })),
+            url_override: Some(url),
+        };
+
+        let (client, _output, _errors) = Client::new(config).unwrap();
+        client.connect().await.unwrap();
+
+        // Force a disconnect by cancelling the rw_token, which triggers reconnection.
+        {
+            let state = client.inner.state.lock();
+            if let Some(ref token) = state.rw_token {
+                token.cancel();
+            }
+        }
+
+        // Wait for reconnection to complete.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(callback_count.load(Ordering::SeqCst), 1);
+
+        client.close().await;
+    }
+
+    // --- Connect twice should not error (port of TestConnectAuthSuccess detail) ---
+
+    #[tokio::test]
+    async fn test_connect_twice_returns_error() {
+        let (url, _server) = mock_ws_server().await;
+        let config = test_config("good", url);
+        let (client, _output, _errors) = Client::new(config).unwrap();
+
+        let first = client.connect().await;
+        assert!(first.is_ok());
+
+        // Second connect should fail because the rqueue_rx was already taken.
+        let second = client.connect().await;
+        assert!(second.is_err());
+
+        client.close().await;
+    }
+
+    // --- Close before connect should not panic ---
+
+    #[tokio::test]
+    async fn test_close_before_connect() {
+        let (url, _server) = mock_ws_server().await;
+        let config = test_config("good", url);
+        let (client, _output, _errors) = Client::new(config).unwrap();
+
+        // Should not panic.
+        client.close().await;
+    }
+
+    // --- Subscribe before connect ---
+
+    #[tokio::test]
+    async fn test_subscribe_before_connect() {
+        let (url, _server) = mock_ws_server().await;
+        let config = test_config("good", url);
+        let (client, _output, _errors) = Client::new(config).unwrap();
+
+        // Subscribe before connect — should be cached.
+        client
+            .subscribe(Topic::StocksTrades, &["SPY"])
+            .await
+            .unwrap();
+        client
+            .subscribe(Topic::StocksQuotes, &["SPY"])
+            .await
+            .unwrap();
+
+        let result = client.connect().await;
+        assert!(result.is_ok());
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        client.close().await;
+    }
+
+    // --- Unsupported topic ---
+
+    #[tokio::test]
+    async fn test_subscribe_unsupported_topic() {
+        let (url, _server) = mock_ws_server().await;
+        let config = test_config("good", url);
+        let (client, _output, _errors) = Client::new(config).unwrap();
+
+        let result = client.subscribe(Topic::CryptoTrades, &["BTC-USD"]).await;
+        assert!(matches!(result, Err(ClientError::UnsupportedTopic(_, _))));
+
+        client.close().await;
+    }
+
+    // --- Data routing ---
+
+    #[tokio::test]
+    async fn test_data_routing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://127.0.0.1:{}", addr.port());
+
+        // Server that sends auth_success then a trade message.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut write, mut read) = ws.split();
+
+            // Wait for auth.
+            if let Some(Ok(_)) = read.next().await {
+                let auth_ok = serde_json::json!([{"ev": "status", "status": "auth_success"}]);
+                write
+                    .send(Message::Text(auth_ok.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+
+            // Wait for subscribe.
+            if let Some(Ok(_)) = read.next().await {
+                let sub_ok = serde_json::json!([
+                    {"ev": "status", "status": "success", "message": "subscribed"}
+                ]);
+                write
+                    .send(Message::Text(sub_ok.to_string().into()))
+                    .await
+                    .unwrap();
+
+                // Send a trade.
+                let trade = serde_json::json!([
+                    {"ev":"T","sym":"SPY","p":450.25,"s":100,"t":1_700_000_000_000_i64,"q":1}
+                ]);
+                write
+                    .send(Message::Text(trade.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+
+            // Keep connection alive briefly.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let config = test_config("good", url);
+        let (client, mut output, _errors) = Client::new(config).unwrap();
+
+        client
+            .subscribe(Topic::StocksTrades, &["SPY"])
+            .await
+            .unwrap();
+        client.connect().await.unwrap();
+
+        // Should receive the trade on the output channel.
+        let data = tokio::time::timeout(Duration::from_secs(2), output.recv()).await;
+        assert!(data.is_ok());
+        let data = data.unwrap().unwrap();
+        match data {
+            MarketData::EquityTrade(t) => {
+                assert_eq!(t.symbol, "SPY");
+                assert_eq!(t.price, 450.25);
+            }
+            other => panic!("expected EquityTrade, got {other:?}"),
+        }
+
+        client.close().await;
+    }
+
+    // --- Data routing: crypto market ---
+
+    #[tokio::test]
+    async fn test_data_routing_crypto() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://127.0.0.1:{}", addr.port());
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut write, mut read) = ws.split();
+
+            // Auth.
+            if let Some(Ok(_)) = read.next().await {
+                let res = serde_json::json!([{"ev": "status", "status": "auth_success"}]);
+                write
+                    .send(Message::Text(res.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            // Subscribe.
+            if let Some(Ok(_)) = read.next().await {
+                let res = serde_json::json!([{"ev": "status", "status": "success"}]);
+                write
+                    .send(Message::Text(res.to_string().into()))
+                    .await
+                    .unwrap();
+
+                let trade = serde_json::json!([
+                    {"ev":"XT","pair":"BTC-USD","p":65000.0,"s":0.5,"t":1_700_000_000_000_i64}
+                ]);
+                write
+                    .send(Message::Text(trade.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let config = Config {
+            api_key: "good".into(),
+            feed: Feed::RealTime,
+            market: Market::Crypto,
+            max_retries: Some(0),
+            raw_data: false,
+            bypass_raw_data_routing: false,
+            reconnect_callback: None,
+            url_override: Some(url),
+        };
+        let (client, mut output, _errors) = Client::new(config).unwrap();
+
+        client
+            .subscribe(Topic::CryptoTrades, &["BTC-USD"])
+            .await
+            .unwrap();
+        client.connect().await.unwrap();
+
+        let data = tokio::time::timeout(Duration::from_secs(2), output.recv()).await;
+        assert!(data.is_ok());
+        match data.unwrap().unwrap() {
+            MarketData::CryptoTrade(t) => {
+                assert_eq!(t.pair, "BTC-USD");
+                assert_eq!(t.price, 65000.0);
+            }
+            other => panic!("expected CryptoTrade, got {other:?}"),
+        }
+
+        client.close().await;
+    }
+
+    // --- Data routing: FMV cross-market ---
+
+    #[tokio::test]
+    async fn test_data_routing_fmv() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://127.0.0.1:{}", addr.port());
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut write, mut read) = ws.split();
+
+            if let Some(Ok(_)) = read.next().await {
+                let res = serde_json::json!([{"ev": "status", "status": "auth_success"}]);
+                write
+                    .send(Message::Text(res.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            if let Some(Ok(_)) = read.next().await {
+                let res = serde_json::json!([{"ev": "status", "status": "success"}]);
+                write
+                    .send(Message::Text(res.to_string().into()))
+                    .await
+                    .unwrap();
+
+                let fmv = serde_json::json!([
+                    {"ev":"FMV","fmv":155.42,"sym":"AAPL","t":1_700_000_000_000_i64}
+                ]);
+                write
+                    .send(Message::Text(fmv.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let config = Config {
+            api_key: "good".into(),
+            feed: Feed::BusinessFeed,
+            market: Market::Stocks,
+            max_retries: Some(0),
+            raw_data: false,
+            bypass_raw_data_routing: false,
+            reconnect_callback: None,
+            url_override: Some(url),
+        };
+        let (client, mut output, _errors) = Client::new(config).unwrap();
+
+        client
+            .subscribe(Topic::BusinessFairMarketValue, &["*"])
+            .await
+            .unwrap();
+        client.connect().await.unwrap();
+
+        let data = tokio::time::timeout(Duration::from_secs(2), output.recv()).await;
+        assert!(data.is_ok());
+        match data.unwrap().unwrap() {
+            MarketData::FairMarketValue(fmv) => {
+                assert_eq!(fmv.ticker, "AAPL");
+                assert_eq!(fmv.fmv, 155.42);
+            }
+            other => panic!("expected FairMarketValue, got {other:?}"),
+        }
+
+        client.close().await;
+    }
+
+    // --- Raw data mode ---
+
+    #[tokio::test]
+    async fn test_raw_data_mode() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://127.0.0.1:{}", addr.port());
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut write, mut read) = ws.split();
+
+            if let Some(Ok(_)) = read.next().await {
+                let res = serde_json::json!([{"ev": "status", "status": "auth_success"}]);
+                write
+                    .send(Message::Text(res.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            if let Some(Ok(_)) = read.next().await {
+                let res = serde_json::json!([{"ev": "status", "status": "success"}]);
+                write
+                    .send(Message::Text(res.to_string().into()))
+                    .await
+                    .unwrap();
+
+                let trade = serde_json::json!([
+                    {"ev":"T","sym":"SPY","p":450.0,"s":100,"t":1_700_000_000_000_i64}
+                ]);
+                write
+                    .send(Message::Text(trade.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let config = Config {
+            api_key: "good".into(),
+            feed: Feed::RealTime,
+            market: Market::Stocks,
+            max_retries: Some(0),
+            raw_data: true,
+            bypass_raw_data_routing: false,
+            reconnect_callback: None,
+            url_override: Some(url),
+        };
+        let (client, mut output, _errors) = Client::new(config).unwrap();
+
+        client
+            .subscribe(Topic::StocksTrades, &["SPY"])
+            .await
+            .unwrap();
+        client.connect().await.unwrap();
+
+        let data = tokio::time::timeout(Duration::from_secs(2), output.recv()).await;
+        assert!(data.is_ok());
+        match data.unwrap().unwrap() {
+            MarketData::Raw(bytes) => {
+                // Raw mode returns the individual JSON element (not the array).
+                let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(v["ev"], "T");
+                assert_eq!(v["sym"], "SPY");
+            }
+            other => panic!("expected Raw, got {other:?}"),
+        }
+
+        client.close().await;
+    }
+
+    // --- Raw data bypass mode ---
+
+    #[tokio::test]
+    async fn test_raw_data_bypass_mode() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://127.0.0.1:{}", addr.port());
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut write, mut read) = ws.split();
+
+            // Don't even wait for auth — bypass means caller handles everything.
+            if let Some(Ok(_)) = read.next().await {
+                let msg = serde_json::json!([{"ev":"status","status":"auth_success"}]);
+                write
+                    .send(Message::Text(msg.to_string().into()))
+                    .await
+                    .unwrap();
+
+                let data = serde_json::json!([{"ev":"T","sym":"AAPL","p":150.0}]);
+                write
+                    .send(Message::Text(data.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let config = Config {
+            api_key: "good".into(),
+            feed: Feed::RealTime,
+            market: Market::Stocks,
+            max_retries: Some(0),
+            raw_data: true,
+            bypass_raw_data_routing: true,
+            reconnect_callback: None,
+            url_override: Some(url),
+        };
+        let (client, mut output, _errors) = Client::new(config).unwrap();
+
+        client.connect().await.unwrap();
+
+        // In bypass mode, raw bytes come through without any internal routing.
+        let data = tokio::time::timeout(Duration::from_secs(2), output.recv()).await;
+        assert!(data.is_ok());
+        match data.unwrap().unwrap() {
+            MarketData::Raw(bytes) => {
+                // Should be the full array, not individual elements.
+                let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(v.is_array());
+            }
+            other => panic!("expected Raw, got {other:?}"),
+        }
+
+        client.close().await;
+    }
+
+    // --- Unsubscribe ---
+
+    #[tokio::test]
+    async fn test_unsubscribe() {
+        let (url, _server) = mock_ws_server().await;
+        let config = test_config("good", url);
+        let (client, _output, _errors) = Client::new(config).unwrap();
+
+        client
+            .subscribe(Topic::StocksTrades, &["AAPL", "TSLA"])
+            .await
+            .unwrap();
+        client
+            .unsubscribe(Topic::StocksTrades, &["AAPL"])
+            .await
+            .unwrap();
+
+        // Verify internal state: only TSLA should remain.
+        let state = client.inner.state.lock();
+        let tickers = state.subs.get_tickers(&Topic::StocksTrades);
+        assert!(tickers.contains(&"TSLA".to_string()));
+        assert!(!tickers.contains(&"AAPL".to_string()));
+    }
+
+    // --- Unsubscribe all (no tickers) ---
+
+    #[tokio::test]
+    async fn test_unsubscribe_all() {
+        let (url, _server) = mock_ws_server().await;
+        let config = test_config("good", url);
+        let (client, _output, _errors) = Client::new(config).unwrap();
+
+        client
+            .subscribe(Topic::StocksTrades, &["AAPL", "TSLA"])
+            .await
+            .unwrap();
+        client.unsubscribe(Topic::StocksTrades, &[]).await.unwrap();
+
+        let state = client.inner.state.lock();
+        let tickers = state.subs.get_tickers(&Topic::StocksTrades);
+        assert!(tickers.is_empty());
+    }
+
+    // --- Multiple messages in one array ---
+
+    #[tokio::test]
+    async fn test_multiple_messages_in_array() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://127.0.0.1:{}", addr.port());
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut write, mut read) = ws.split();
+
+            if let Some(Ok(_)) = read.next().await {
+                let res = serde_json::json!([{"ev": "status", "status": "auth_success"}]);
+                write
+                    .send(Message::Text(res.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            if let Some(Ok(_)) = read.next().await {
+                let res = serde_json::json!([{"ev": "status", "status": "success"}]);
+                write
+                    .send(Message::Text(res.to_string().into()))
+                    .await
+                    .unwrap();
+
+                // Send 3 trades in one array (server batching).
+                let batch = serde_json::json!([
+                    {"ev":"T","sym":"AAPL","p":150.0,"s":10,"t":1_700_000_000_000_i64,"q":1},
+                    {"ev":"T","sym":"TSLA","p":250.0,"s":20,"t":1_700_000_000_001_i64,"q":2},
+                    {"ev":"T","sym":"MSFT","p":350.0,"s":30,"t":1_700_000_000_002_i64,"q":3}
+                ]);
+                write
+                    .send(Message::Text(batch.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let config = test_config("good", url);
+        let (client, mut output, _errors) = Client::new(config).unwrap();
+
+        client.subscribe(Topic::StocksTrades, &["*"]).await.unwrap();
+        client.connect().await.unwrap();
+
+        // Should receive 3 separate MarketData items.
+        let mut symbols = Vec::new();
+        for _ in 0..3 {
+            let data = tokio::time::timeout(Duration::from_secs(2), output.recv()).await;
+            match data.unwrap().unwrap() {
+                MarketData::EquityTrade(t) => symbols.push(t.symbol.clone()),
+                other => panic!("expected EquityTrade, got {other:?}"),
+            }
+        }
+
+        symbols.sort();
+        assert_eq!(symbols, vec!["AAPL", "MSFT", "TSLA"]);
+
+        client.close().await;
+    }
+}

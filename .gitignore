@@ -1,0 +1,7 @@
+/target
+/ci-out
+/fuzz/target
+/fuzz/artifacts
+/fuzz/corpus/**/crash-*
+/fuzz/corpus/**/leak-*
+*.proptest-regressions
