@@ -143,13 +143,11 @@ fn bench_event_type_peek(c: &mut Criterion) {
 fn bench_full_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("full_pipeline");
 
-    // Single trade through the full pipeline.
+    // Single trade through the full pipeline (matches actual process_loop).
     group.bench_function("single_trade", |b| {
-        let data = SERVER_ARRAY_1;
+        use massive_rust_client::websocket::json_array_elements;
         b.iter(|| {
-            let msgs: Vec<&serde_json::value::RawValue> = serde_json::from_str(data).unwrap();
-            for raw_msg in &msgs {
-                let raw = raw_msg.get();
+            for raw in json_array_elements(SERVER_ARRAY_1) {
                 let _ = peek_event_type(raw.as_bytes());
                 let _trade: EquityTrade = serde_json::from_str(raw).unwrap();
             }
@@ -160,10 +158,9 @@ fn bench_full_pipeline(c: &mut Criterion) {
     let arr_10 = server_array_10();
     group.throughput(Throughput::Elements(10));
     group.bench_function("batch_10_trades", |b| {
+        use massive_rust_client::websocket::json_array_elements;
         b.iter(|| {
-            let msgs: Vec<&serde_json::value::RawValue> = serde_json::from_str(&arr_10).unwrap();
-            for raw_msg in &msgs {
-                let raw = raw_msg.get();
+            for raw in json_array_elements(&arr_10) {
                 let _ = peek_event_type(raw.as_bytes());
                 let _trade: EquityTrade = serde_json::from_str(raw).unwrap();
             }

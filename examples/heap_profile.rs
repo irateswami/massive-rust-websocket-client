@@ -30,7 +30,7 @@ fn simulate_hot_path(iterations: usize) {
             // Step 2: peek at "ev" field (zero-alloc byte scan)
             let event_type = peek_event_type(raw.as_bytes()).unwrap_or("");
 
-            // Step 3: full deserialization based on event type
+            // Step 3: deserialization based on event type
             match event_type {
                 "T" => {
                     let _trade: EquityTrade = serde_json::from_str(raw).unwrap();
