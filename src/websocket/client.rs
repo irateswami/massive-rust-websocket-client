@@ -47,6 +47,7 @@ pub enum MarketData {
     FuturesAggregate(models::FuturesAggregate),
     FuturesTrade(models::FuturesTrade),
     FuturesQuote(models::FuturesQuote),
+    SequenceGap(models::SequenceGap),
     Raw(Bytes),
 }
 
@@ -278,6 +279,16 @@ fn do_connect(
     reconnect: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ClientError>> + Send>> {
     Box::pin(async move {
+        // On reconnect, defensively ensure the old connection state is cleared.
+        if reconnect {
+            let mut state = inner.state.lock();
+            state.wqueue_tx = None;
+            if let Some(token) = state.rw_token.take() {
+                token.cancel();
+            }
+            state.connected = false;
+        }
+
         let mut ws_config = WebSocketConfig::default();
         ws_config.max_message_size = Some(MAX_MESSAGE_SIZE);
 
@@ -334,24 +345,13 @@ fn do_connect(
         }
 
         // Spawn connection monitor (detects disconnect, triggers reconnect).
-        if !reconnect {
-            let monitor_inner = inner.clone();
-            tokio::spawn(connection_monitor(
-                monitor_inner,
-                read_handle,
-                write_handle,
-                rw_token,
-            ));
-        } else {
-            // On reconnect the existing monitor is gone; spawn a new one.
-            let monitor_inner = inner.clone();
-            tokio::spawn(connection_monitor(
-                monitor_inner,
-                read_handle,
-                write_handle,
-                rw_token,
-            ));
-        }
+        let monitor_inner = inner.clone();
+        tokio::spawn(connection_monitor(
+            monitor_inner,
+            read_handle,
+            write_handle,
+            rw_token,
+        ));
 
         Ok(())
     }) // Box::pin
@@ -364,18 +364,44 @@ async fn connection_monitor(
     write_handle: JoinHandle<()>,
     rw_token: tokio_util::sync::CancellationToken,
 ) {
+    let mut read_handle = read_handle;
+    let mut write_handle = write_handle;
+
     // Wait for either task to exit.
-    tokio::select! {
-        _ = read_handle => {
+    let read_exited_first = tokio::select! {
+        _ = &mut read_handle => {
             tracing::debug!("read task exited");
+            true
         }
-        _ = write_handle => {
+        _ = &mut write_handle => {
             tracing::debug!("write task exited");
+            false
         }
-    }
+    };
 
     // Cancel the surviving task.
     rw_token.cancel();
+
+    // Wait for the surviving task to fully shut down. This ensures the old
+    // WebSocket (including its TCP socket) is closed before we reconnect,
+    // preventing "max_connections" errors on the server.
+    let shutdown_timeout = WRITE_WAIT + Duration::from_secs(1);
+    if read_exited_first {
+        if tokio::time::timeout(shutdown_timeout, &mut write_handle).await.is_err() {
+            write_handle.abort();
+        }
+    } else {
+        if tokio::time::timeout(shutdown_timeout, &mut read_handle).await.is_err() {
+            read_handle.abort();
+        }
+    }
+
+    // Clear connection state so the server sees a clean disconnect.
+    {
+        let mut state = inner.state.lock();
+        state.connected = false;
+        state.wqueue_tx = None;
+    }
 
     let should_close = inner.state.lock().should_close;
     if should_close {
@@ -581,6 +607,73 @@ async fn write_loop(
     tracing::debug!("write task closed");
 }
 
+// ---------------------------------------------------------------------------
+// Sequence gap detection
+// ---------------------------------------------------------------------------
+
+use compact_str::CompactString;
+
+/// Tracks the last sequence number per (symbol, event_type) pair.
+///
+/// Uses a Vec with linear scan instead of HashMap: no hashing, no key cloning
+/// on lookup, and cache-friendly for the typical <100 ticker working set.
+struct SequenceTracker {
+    entries: Vec<(CompactString, CompactString, i64)>,
+}
+
+impl SequenceTracker {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Checks for a sequence discontinuity. Returns `Some(SequenceGap)` when
+    /// `received != last_seen + 1` for that (symbol, event_type) pair.
+    /// Skips messages with sequence_number == 0 (field absent from JSON).
+    fn check(&mut self, md: &MarketData) -> Option<models::SequenceGap> {
+        let (symbol, ev, seq) = Self::extract(md)?;
+        if seq == 0 {
+            return None;
+        }
+
+        // Linear scan — compare borrowed references, no cloning on the hot path.
+        for entry in self.entries.iter_mut() {
+            if entry.0 == *symbol && entry.1 == *ev {
+                let prev = entry.2;
+                entry.2 = seq;
+                if seq != prev + 1 {
+                    return Some(models::SequenceGap {
+                        symbol: symbol.clone(),
+                        event_type: ev.clone(),
+                        last_seen: prev,
+                        received: seq,
+                    });
+                }
+                return None;
+            }
+        }
+
+        // First occurrence for this (symbol, event_type) — record it.
+        self.entries.push((symbol.clone(), ev.clone(), seq));
+        None
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn extract(md: &MarketData) -> Option<(&CompactString, &CompactString, i64)> {
+        match md {
+            MarketData::EquityTrade(t) => Some((&t.symbol, &t.event_type, t.sequence_number)),
+            MarketData::EquityQuote(q) => Some((&q.symbol, &q.event_type, q.sequence_number)),
+            MarketData::LimitUpLimitDown(l) => Some((&l.symbol, &l.event_type, l.sequence_number)),
+            MarketData::FuturesTrade(t) => Some((&t.symbol, &t.event_type, t.sequence_number)),
+            _ => None,
+        }
+    }
+}
+
 async fn process_loop(
     mut rqueue_rx: mpsc::Receiver<Utf8Bytes>,
     output_tx: mpsc::Sender<MarketData>,
@@ -590,6 +683,8 @@ async fn process_loop(
     bypass_raw_data_routing: bool,
     proc_token: tokio_util::sync::CancellationToken,
 ) {
+    let mut seq_tracker = SequenceTracker::new();
+
     loop {
         tokio::select! {
             _ = proc_token.cancelled() => break,
@@ -616,6 +711,11 @@ async fn process_loop(
 
                     match event_type {
                         "status" => {
+                            // Server sends "connected" on each new connection.
+                            // Clear the tracker so a reconnect doesn't false-positive.
+                            if raw_element.contains("\"connected\"") {
+                                seq_tracker.clear();
+                            }
                             if let Err(e) = handle_status(raw_element) {
                                 let _ = error_tx.send(e).await;
                                 return; // fatal
@@ -631,6 +731,16 @@ async fn process_loop(
                             } else {
                                 match route_data(&market, event_type, raw_element) {
                                     Ok(Some(market_data)) => {
+                                        if let Some(gap) = seq_tracker.check(&market_data) {
+                                            tracing::warn!(
+                                                symbol = %gap.symbol,
+                                                event_type = %gap.event_type,
+                                                last_seen = gap.last_seen,
+                                                received = gap.received,
+                                                "sequence gap detected"
+                                            );
+                                            let _ = output_tx.send(MarketData::SequenceGap(gap)).await;
+                                        }
                                         let _ = output_tx.send(market_data).await;
                                     }
                                     Ok(None) => {}
@@ -752,6 +862,9 @@ fn handle_status(raw: &str) -> Result<(), ClientError> {
             return Err(ClientError::AuthFailed(
                 "authentication failed: closing connection".into(),
             ));
+        }
+        "max_connections" => {
+            return Err(ClientError::MaxConnections(cm.message.to_string()));
         }
         "success" => tracing::debug!("status success: {}", sanitize(&cm.message)),
         "error" => tracing::error!("status error: {}", sanitize(&cm.message)),
@@ -1607,6 +1720,232 @@ mod tests {
 
         symbols.sort();
         assert_eq!(symbols, vec!["AAPL", "MSFT", "TSLA"]);
+
+        client.close().await;
+    }
+
+    // --- Sequence gap detection ---
+
+    #[test]
+    fn test_sequence_tracker_no_gap() {
+        let mut tracker = SequenceTracker::new();
+
+        let t1 = MarketData::EquityTrade(models::EquityTrade {
+            event_type: "T".into(),
+            symbol: "AAPL".into(),
+            sequence_number: 1,
+            ..Default::default()
+        });
+        let t2 = MarketData::EquityTrade(models::EquityTrade {
+            event_type: "T".into(),
+            symbol: "AAPL".into(),
+            sequence_number: 2,
+            ..Default::default()
+        });
+
+        assert!(tracker.check(&t1).is_none()); // first seen
+        assert!(tracker.check(&t2).is_none()); // consecutive
+    }
+
+    #[test]
+    fn test_sequence_tracker_forward_gap() {
+        let mut tracker = SequenceTracker::new();
+
+        let t1 = MarketData::EquityTrade(models::EquityTrade {
+            event_type: "T".into(),
+            symbol: "SPY".into(),
+            sequence_number: 10,
+            ..Default::default()
+        });
+        let t2 = MarketData::EquityTrade(models::EquityTrade {
+            event_type: "T".into(),
+            symbol: "SPY".into(),
+            sequence_number: 15,
+            ..Default::default()
+        });
+
+        assert!(tracker.check(&t1).is_none());
+        let gap = tracker.check(&t2).expect("should detect gap");
+        assert_eq!(gap.symbol, "SPY");
+        assert_eq!(gap.event_type, "T");
+        assert_eq!(gap.last_seen, 10);
+        assert_eq!(gap.received, 15);
+    }
+
+    #[test]
+    fn test_sequence_tracker_backward_jump() {
+        let mut tracker = SequenceTracker::new();
+
+        let t1 = MarketData::EquityQuote(models::EquityQuote {
+            event_type: "Q".into(),
+            symbol: "TSLA".into(),
+            sequence_number: 100,
+            ..Default::default()
+        });
+        let t2 = MarketData::EquityQuote(models::EquityQuote {
+            event_type: "Q".into(),
+            symbol: "TSLA".into(),
+            sequence_number: 50,
+            ..Default::default()
+        });
+
+        assert!(tracker.check(&t1).is_none());
+        let gap = tracker.check(&t2).expect("should detect backward jump");
+        assert_eq!(gap.last_seen, 100);
+        assert_eq!(gap.received, 50);
+    }
+
+    #[test]
+    fn test_sequence_tracker_independent_streams() {
+        let mut tracker = SequenceTracker::new();
+
+        // Trade and quote for same ticker have independent sequence spaces.
+        let trade = MarketData::EquityTrade(models::EquityTrade {
+            event_type: "T".into(),
+            symbol: "AAPL".into(),
+            sequence_number: 1,
+            ..Default::default()
+        });
+        let quote = MarketData::EquityQuote(models::EquityQuote {
+            event_type: "Q".into(),
+            symbol: "AAPL".into(),
+            sequence_number: 1,
+            ..Default::default()
+        });
+
+        assert!(tracker.check(&trade).is_none());
+        assert!(tracker.check(&quote).is_none()); // different stream, no gap
+    }
+
+    #[test]
+    fn test_sequence_tracker_skips_zero() {
+        let mut tracker = SequenceTracker::new();
+
+        let t = MarketData::EquityTrade(models::EquityTrade {
+            event_type: "T".into(),
+            symbol: "X".into(),
+            sequence_number: 0,
+            ..Default::default()
+        });
+        assert!(tracker.check(&t).is_none());
+    }
+
+    #[test]
+    fn test_sequence_tracker_clear() {
+        let mut tracker = SequenceTracker::new();
+
+        let t1 = MarketData::EquityTrade(models::EquityTrade {
+            event_type: "T".into(),
+            symbol: "SPY".into(),
+            sequence_number: 100,
+            ..Default::default()
+        });
+        tracker.check(&t1);
+        tracker.clear();
+
+        // After clear, seq=1 should not trigger a gap (treated as first-seen).
+        let t2 = MarketData::EquityTrade(models::EquityTrade {
+            event_type: "T".into(),
+            symbol: "SPY".into(),
+            sequence_number: 1,
+            ..Default::default()
+        });
+        assert!(tracker.check(&t2).is_none());
+    }
+
+    #[test]
+    fn test_sequence_tracker_ignores_non_sequenced_types() {
+        let mut tracker = SequenceTracker::new();
+
+        let agg = MarketData::EquityAgg(models::EquityAgg {
+            event_type: "A".into(),
+            symbol: "SPY".into(),
+            ..Default::default()
+        });
+        assert!(tracker.check(&agg).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_gap_emitted_before_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://127.0.0.1:{}", addr.port());
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut write, mut read) = ws.split();
+
+            if let Some(Ok(_)) = read.next().await {
+                let res = serde_json::json!([{"ev": "status", "status": "auth_success"}]);
+                write
+                    .send(Message::Text(res.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            if let Some(Ok(_)) = read.next().await {
+                let res = serde_json::json!([{"ev": "status", "status": "success"}]);
+                write
+                    .send(Message::Text(res.to_string().into()))
+                    .await
+                    .unwrap();
+
+                // seq 1, then skip to seq 5.
+                let batch = serde_json::json!([
+                    {"ev":"T","sym":"SPY","p":450.0,"s":100,"t":1_700_000_000_000_i64,"q":1},
+                    {"ev":"T","sym":"SPY","p":451.0,"s":200,"t":1_700_000_000_001_i64,"q":5}
+                ]);
+                write
+                    .send(Message::Text(batch.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let config = test_config("good", url);
+        let (client, mut output, _errors) = Client::new(config).unwrap();
+
+        client
+            .subscribe(Topic::StocksTrades, &["SPY"])
+            .await
+            .unwrap();
+        client.connect().await.unwrap();
+
+        // First: the trade at seq=1 (no gap).
+        let msg1 = tokio::time::timeout(Duration::from_secs(2), output.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg1, MarketData::EquityTrade(_)));
+
+        // Second: the SequenceGap notification.
+        let msg2 = tokio::time::timeout(Duration::from_secs(2), output.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match msg2 {
+            MarketData::SequenceGap(gap) => {
+                assert_eq!(gap.symbol, "SPY");
+                assert_eq!(gap.event_type, "T");
+                assert_eq!(gap.last_seen, 1);
+                assert_eq!(gap.received, 5);
+            }
+            other => panic!("expected SequenceGap, got {other:?}"),
+        }
+
+        // Third: the trade at seq=5 (delivered after the gap event).
+        let msg3 = tokio::time::timeout(Duration::from_secs(2), output.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match msg3 {
+            MarketData::EquityTrade(t) => {
+                assert_eq!(t.sequence_number, 5);
+                assert_eq!(t.price, 451.0);
+            }
+            other => panic!("expected EquityTrade, got {other:?}"),
+        }
 
         client.close().await;
     }

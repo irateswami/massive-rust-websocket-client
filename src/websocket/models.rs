@@ -14,7 +14,7 @@ pub struct ControlMessage {
 }
 
 /// Aggregate for stock tickers or option contracts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EquityAgg {
     #[serde(rename = "ev", default)]
     pub event_type: CompactString,
@@ -76,7 +76,7 @@ pub struct CurrencyAgg {
 }
 
 /// Trade data for stock tickers or option contracts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EquityTrade {
     #[serde(rename = "ev", default)]
     pub event_type: CompactString,
@@ -128,7 +128,7 @@ pub struct CryptoTrade {
 }
 
 /// Quote for stock tickers or option contracts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EquityQuote {
     #[serde(rename = "ev", default)]
     pub event_type: CompactString,
@@ -367,6 +367,17 @@ pub struct FuturesAggregate {
     pub start_timestamp: i64,
     #[serde(rename = "e", default)]
     pub end_timestamp: i64,
+}
+
+/// Emitted when a gap is detected in per-ticker sequence numbers.
+/// Consumers should flush any stateful processing (e.g. ring buffers,
+/// classifiers) for the affected ticker and suppress output until state refills.
+#[derive(Debug, Clone)]
+pub struct SequenceGap {
+    pub symbol: CompactString,
+    pub event_type: CompactString,
+    pub last_seen: i64,
+    pub received: i64,
 }
 
 #[cfg(test)]

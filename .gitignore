@@ -5,3 +5,10 @@
 /fuzz/corpus/**/crash-*
 /fuzz/corpus/**/leak-*
 *.proptest-regressions
+
+# Vendored / external SDKs
+/IBJts
+/META-INF
+
+# Profiling artifacts
+dhat-heap.json

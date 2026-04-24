@@ -12,6 +12,9 @@ pub enum ClientError {
     #[error("max reconnection attempts exceeded")]
     MaxRetriesExceeded,
 
+    #[error("max connections exceeded: {0}")]
+    MaxConnections(String),
+
     #[error("invalid config: {0}")]
     InvalidConfig(String),
 
